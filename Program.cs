@@ -24,6 +24,8 @@ builder.Services.AddScoped<PersonalService>();
 builder.Services.AddScoped<ServicioService>();
 builder.Services.AddScoped<TipoServicioService>();
 builder.Services.AddScoped<TipoVehiculoService>();
+builder.Services.AddHttpClient<Firebase.Services.AuthenticationService>();
+builder.Services.AddScoped<Firebase.Services.AuthenticationService>();
 var app = builder.Build();
 
 if (!app.Environment.IsDevelopment())

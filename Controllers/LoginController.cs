@@ -1,4 +1,4 @@
-﻿using FirebaseAdmin;
+using FirebaseAdmin;
 using Firebase.Models;
 using FirebaseAdmin.Auth;
 using Google.Cloud.Firestore;
@@ -9,25 +9,39 @@ using System.ComponentModel.DataAnnotations;
 using System.Security.Claims;
 using System.Threading.Tasks;
 using static Firebase.Models.AuthModels;
-using Newtonsoft.Json;
-using System.Text;
+using Firebase.Services;
 
+/// <summary>
+/// Controlador para la gestión de autenticación y registro de usuarios.
+/// Maneja el inicio de sesión con email/contraseña, registro de nuevos usuarios y autenticación con Google.
+/// </summary>
 public class LoginController : Controller
 {
-    private readonly FirestoreDb _firestore;
-    private readonly AuditService _auditService;
+    private readonly Firebase.Services.AuthenticationService _authService;
 
-    public LoginController(FirestoreDb firestore, AuditService auditService)
+    /// <summary>
+    /// Constructor del controlador de login.
+    /// </summary>
+    /// <param name="authService">Servicio de autenticación</param>
+    public LoginController(Firebase.Services.AuthenticationService authService)
     {
-        _firestore = firestore;
-        _auditService = auditService;
+        _authService = authService;
     }
 
+    /// <summary>
+    /// Muestra la página principal de login/registro.
+    /// </summary>
+    /// <returns>Vista de login</returns>
     public IActionResult Index()
     {
         return View();
     }
 
+    /// <summary>
+    /// Procesa el inicio de sesión con email y contraseña.
+    /// </summary>
+    /// <param name="request">Datos de login del usuario</param>
+    /// <returns>Resultado de la autenticación</returns>
     [HttpPost]
     public async Task<IActionResult> Login(LoginRequest request)
     {
@@ -39,64 +53,20 @@ public class LoginController : Controller
 
         try
         {
-            var firebaseApiKey = "AIzaSyBubyUIDmvFmRIvQ--pvnw9wnQcAulJJy8"; // Reemplaza con tu API Key de Firebase
-            var client = new HttpClient();
-            var uri = $"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={firebaseApiKey}";
-
-            var loginInfo = new
+            var result = await _authService.AuthenticateWithEmailAsync(request.Email, request.Password);
+            
+            if (!result.IsSuccess)
             {
-                email = request.Email,
-                password = request.Password,
-                returnSecureToken = true
-            };
-
-            var content = new StringContent(JsonConvert.SerializeObject(loginInfo), Encoding.UTF8, "application/json");
-            var response = await client.PostAsync(uri, content);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var errorResponse = await response.Content.ReadAsStringAsync();
-                var firebaseError = JsonConvert.DeserializeObject<FirebaseErrorResponse>(errorResponse);
-                // Obtener el código de error
-                var errorCode = firebaseError.error.message.Split(' ').FirstOrDefault(); ;
-                // Traducir el código de error al mensaje en español
-                ViewBag.Error = GetFirebaseErrorMessage(errorCode);
+                ViewBag.Error = result.ErrorMessage;
                 return View("Index");
             }
 
-            var responseData = await response.Content.ReadAsStringAsync();
-            var loginResponse = JsonConvert.DeserializeObject<FirebaseLoginResponse>(responseData);
-
-            // Obtener el UID del usuario desde la respuesta
-            var uid = loginResponse.localId;
-
-            // Obtener datos adicionales desde Firestore
-            var employeeDoc = await _firestore.Collection("empleados").Document(uid).GetSnapshotAsync();
-
-            if (!employeeDoc.Exists || employeeDoc.GetValue<string>("Estado") != "Activo")
-            {
-                ViewBag.Error = "Cuenta inactiva, contacte con el administrador.";
-                return View("Index");
-            }
-
-            // Crear claims y autenticar
-            var claims = new List<Claim>
-        {
-            new Claim(ClaimTypes.NameIdentifier, uid),
-            new Claim(ClaimTypes.Name, employeeDoc.GetValue<string>("Nombre")),
-            new Claim(ClaimTypes.Email, request.Email),
-            new Claim(ClaimTypes.Role, employeeDoc.GetValue<string>("Rol"))
-        };
-
-            var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
-            var principal = new ClaimsPrincipal(identity);
-
-            await HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal);
+            // Crear claims y autenticar al usuario
+            await SignInUserAsync(result.UserInfo!);
 
             // Registrar evento de inicio de sesión en Google Analytics
             TempData["LoginEvent"] = true;
-            // Registrar evento de auditoría
-            await _auditService.LogEvent(uid, request.Email, "Inicio de sesión", null, null);
+            
             return RedirectToAction("Index", "Lavados");
         }
         catch (Exception)
@@ -106,6 +76,11 @@ public class LoginController : Controller
         }
     }
 
+    /// <summary>
+    /// Procesa el registro de un nuevo usuario.
+    /// </summary>
+    /// <param name="request">Datos de registro del usuario</param>
+    /// <returns>Resultado del registro</returns>
     [HttpPost]
     public async Task<IActionResult> RegisterUser(RegisterRequest request)
     {
@@ -117,71 +92,18 @@ public class LoginController : Controller
 
         try
         {
-            // Crear usuario en Firebase Authentication
-            var userRecordArgs = new UserRecordArgs
+            var result = await _authService.RegisterUserAsync(request);
+            
+            if (!result.IsSuccess)
             {
-                Email = request.Email,
-                Password = request.Password,
-                DisplayName = request.NombreCompleto
-            };
-
-            var userRecord = await FirebaseAuth.DefaultInstance.CreateUserAsync(userRecordArgs);
-
-            // Guardar datos adicionales en Firestore sin la contraseña
-            var employeeData = new Dictionary<string, object>
-        {
-            { "Uid", userRecord.Uid },
-            { "Nombre", request.NombreCompleto },
-            { "Email", request.Email },
-            { "Rol", "Empleado" },
-            { "Estado", "Activo" }
-        };
-
-            await _firestore.Collection("empleados").Document(userRecord.Uid).SetAsync(employeeData);
-
-            // *** Autenticar al usuario con Firebase Authentication ***
-
-            var firebaseApiKey = "AIzaSyBubyUIDmvFmRIvQ--pvnw9wnQcAulJJy8"; // Reemplaza con tu API Key de Firebase
-            var client = new HttpClient();
-            var uri = $"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={firebaseApiKey}";
-
-            var loginInfo = new
-            {
-                email = request.Email,
-                password = request.Password,
-                returnSecureToken = true
-            };
-
-            var content = new StringContent(JsonConvert.SerializeObject(loginInfo), Encoding.UTF8, "application/json");
-            var response = await client.PostAsync(uri, content);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var errorResponse = await response.Content.ReadAsStringAsync();
-                var firebaseError = JsonConvert.DeserializeObject<FirebaseErrorResponse>(errorResponse);
-                // Obtener el código de error
-                var errorCode = firebaseError.error.message.Split(' ').FirstOrDefault(); ;
-                // Traducir el código de error al mensaje en español
-                ViewBag.Error = GetFirebaseErrorMessage(errorCode);
+                ViewBag.Error = result.ErrorMessage;
                 return View("Index");
             }
 
-            var responseData = await response.Content.ReadAsStringAsync();
-            var loginResponse = JsonConvert.DeserializeObject<FirebaseLoginResponse>(responseData);
-
-            // Autenticar al usuario en tu aplicación
-            await SignInUser(userRecord.Uid, request.Email, "Empleado", request.NombreCompleto);
-            // Registrar evento de auditoría
-            await _auditService.LogEvent(userRecord.Uid, request.Email, "Inicio de sesión", null, null);
+            // Autenticar al usuario recién registrado
+            await SignInUserAsync(result.UserInfo!);
+            
             return RedirectToAction("Index", "Lavados");
-        }
-        catch (FirebaseAuthException ex)
-        {
-            // Obtener el código de error
-            var errorCode = ex.AuthErrorCode.ToString();
-            // Traducir el código de error al mensaje en español
-            ViewBag.Error = $"Error al registrar el usuario: {GetFirebaseErrorMessage(errorCode)}";
-            return View("Index");
         }
         catch (Exception)
         {
@@ -190,149 +112,64 @@ public class LoginController : Controller
         }
     }
 
+    /// <summary>
+    /// Procesa la autenticación con Google.
+    /// </summary>
+    /// <param name="request">Token de ID de Google</param>
+    /// <returns>Resultado de la autenticación</returns>
     [HttpPost]
     public async Task<IActionResult> LoginWithGoogle([FromBody] GoogleLoginRequest request)
     {
         try
         {
-            var decodedToken = await FirebaseAdmin.Auth.FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(request.IdToken);
-            var email = decodedToken.Claims["email"].ToString();
-            var displayName = decodedToken.Claims["name"].ToString();
-            var uid = decodedToken.Uid; // UID generado por Google
-
-            var employeesCollection = _firestore.Collection("empleados");
+            var result = await _authService.AuthenticateWithGoogleAsync(request.IdToken);
             
-            // Buscar primero por UID (más eficiente), luego por email como fallback
-            var employeeDoc = await employeesCollection.Document(uid).GetSnapshotAsync();
-            
-            string role;
-            string estado;
-            
-            if (!employeeDoc.Exists)
+            if (!result.IsSuccess)
             {
-                // Verificar si existe un empleado con este email (migración de cuentas)
-                var emailQuery = employeesCollection.WhereEqualTo("Email", email);
-                var emailSnapshot = await emailQuery.GetSnapshotAsync();
-                
-                if (emailSnapshot.Count > 0)
-                {
-                    // Empleado existe con email pero sin UID correcto
-                    var existingEmployee = emailSnapshot.Documents[0];
-                    role = existingEmployee.GetValue<string>("Rol");
-                    estado = existingEmployee.GetValue<string>("Estado");
-                    
-                    if (estado != "Activo")
-                    {
-                        return BadRequest(new { error = "Su cuenta está inactiva. Por favor, contacte al administrador." });
-                    }
-                    
-                    // Migrar: eliminar documento viejo y crear con UID correcto
-                    await existingEmployee.Reference.DeleteAsync();
-                    
-                    var migratedEmployee = new Dictionary<string, object>
-                    {
-                        { "Uid", uid },
-                        { "Nombre", displayName },
-                        { "Email", email },
-                        { "Rol", role },
-                        { "Estado", estado }
-                    };
-                    await employeesCollection.Document(uid).SetAsync(migratedEmployee);
-                    
-                    await _auditService.LogEvent(uid, email, "Migración a Google Auth", uid, "Empleado");
-                }
-                else
-                {
-                    // Empleado completamente nuevo
-                    role = "Empleado";
-                    estado = "Activo";
-                    
-                    var newEmployee = new Dictionary<string, object>
-                    {
-                        { "Uid", uid },
-                        { "Nombre", displayName },
-                        { "Email", email },
-                        { "Rol", role },
-                        { "Estado", estado }
-                    };
-                    await employeesCollection.Document(uid).SetAsync(newEmployee);
-                    
-                    await _auditService.LogEvent(uid, email, "Registro con Google", uid, "Empleado");
-                }
-            }
-            else
-            {
-                // Empleado ya existe con UID correcto
-                role = employeeDoc.GetValue<string>("Rol");
-                estado = employeeDoc.GetValue<string>("Estado");
-
-                if (estado != "Activo")
-                {
-                    return BadRequest(new { error = "Su cuenta está inactiva. Por favor, contacte al administrador." });
-                }
+                return BadRequest(new { error = result.ErrorMessage });
             }
 
-            var claims = new List<Claim>
-        {
-            new Claim(ClaimTypes.NameIdentifier, uid), // ← CRÍTICO: agregar UID
-            new Claim(ClaimTypes.Name, displayName),
-            new Claim(ClaimTypes.Email, email),
-            new Claim(ClaimTypes.Role, role)
-        };
-
-            var claimsIdentity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
-            var authProperties = new AuthenticationProperties
-            {
-                IsPersistent = true
-            };
-
-            await HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(claimsIdentity), authProperties);
-
-            // Registrar inicio de sesión
-            await _auditService.LogEvent(uid, email, "Inicio de sesión con Google", null, null);
+            // Crear claims y autenticar al usuario
+            await SignInUserAsync(result.UserInfo!, isPersistent: true);
 
             return Json(new { redirectUrl = Url.Action("Index", "Lavados") });
         }
-        catch (Firebase.Auth.FirebaseAuthException ex)
+        catch (Exception)
         {
-            return BadRequest(new { error = "Error de autenticación: " + ex.Message });
+            return BadRequest(new { error = "Error al autenticar con Google. Por favor, intente de nuevo." });
         }
     }
-    private async Task SignInUser(string uid, string email, string role, string nombre)
-    {
-        var claims = new List<Claim>
-    {
-        new Claim(ClaimTypes.NameIdentifier, uid),
-        new Claim(ClaimTypes.Name, nombre),
-        new Claim(ClaimTypes.Email, email),
-        new Claim(ClaimTypes.Role, role)
-    };
 
+    /// <summary>
+    /// Autentica al usuario en la aplicación creando las claims correspondientes.
+    /// </summary>
+    /// <param name="userInfo">Información del usuario</param>
+    /// <param name="isPersistent">Indica si la sesión debe ser persistente</param>
+    /// <returns>Task</returns>
+    private async Task SignInUserAsync(UserInfo userInfo, bool isPersistent = false)
+    {
+        var claims = _authService.CreateUserClaims(userInfo);
         var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
         var principal = new ClaimsPrincipal(identity);
-
-        await HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal);
-    }
-    private string GetFirebaseErrorMessage(string errorCode)
-    {
-        return errorCode switch
+        
+        var authProperties = new AuthenticationProperties
         {
-            "EMAIL_EXISTS" => "El correo electrónico ya está registrado.",
-            "INVALID_PASSWORD" => "La contraseña es incorrecta.",
-            "INVALID_EMAIL" => "El correo electrónico no es válido.",
-            "USER_DISABLED" => "La cuenta ha sido deshabilitada por un administrador.",
-            "EMAIL_NOT_FOUND" => "No existe ninguna cuenta con este correo electrónico.",
-            "OPERATION_NOT_ALLOWED" => "Operación no permitida.",
-            "TOO_MANY_ATTEMPTS_TRY_LATER" => "Demasiados intentos fallidos. Inténtalo más tarde.",
-            "INVALID_LOGIN_CREDENTIALS" => "Credenciales de inicio de sesión inválidas.",
-            _ => "Se ha producido un error al procesar la solicitud."
+            IsPersistent = isPersistent
         };
-    }
 
+        await HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal, authProperties);
+    }
 }
 
+/// <summary>
+/// Modelo para las solicitudes de login con Google.
+/// </summary>
 public class GoogleLoginRequest
 {
-    public string IdToken { get; set; }
+    /// <summary>
+    /// Token de ID proporcionado por Google.
+    /// </summary>
+    [Required]
+    public required string IdToken { get; set; }
 }
 
